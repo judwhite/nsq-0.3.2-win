@@ -7,16 +7,14 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/bitly/nsq/internal/app"
-	"github.com/bitly/nsq/internal/version"
 	"github.com/bitly/nsq/nsqd"
+	"github.com/bitly/nsq/util"
+	"github.com/kardianos/service"
 	"github.com/mreiferson/go-options"
 )
 
@@ -86,11 +84,11 @@ func nsqFlagset() *flag.FlagSet {
 	flagSet.String("http-address", "0.0.0.0:4151", "<addr>:<port> to listen on for HTTP clients")
 	flagSet.String("tcp-address", "0.0.0.0:4150", "<addr>:<port> to listen on for TCP clients")
 
-	authHTTPAddresses := app.StringArray{}
+	authHTTPAddresses := util.StringArray{}
 	flagSet.Var(&authHTTPAddresses, "auth-http-address", "<addr>:<port> to query auth server (may be given multiple times)")
 
 	flagSet.String("broadcast-address", "", "address that will be registered with lookupd (defaults to the OS hostname)")
-	lookupdTCPAddrs := app.StringArray{}
+	lookupdTCPAddrs := util.StringArray{}
 	flagSet.Var(&lookupdTCPAddrs, "lookupd-tcp-address", "lookupd TCP address (may be given multiple times)")
 
 	// diskqueue options
@@ -122,7 +120,7 @@ func nsqFlagset() *flag.FlagSet {
 	flagSet.String("statsd-prefix", "nsq.%s", "prefix used for keys sent to statsd (%s for host replacement)")
 
 	// End to end percentile flags
-	e2eProcessingLatencyPercentiles := app.FloatArray{}
+	e2eProcessingLatencyPercentiles := util.FloatArray{}
 	flagSet.Var(&e2eProcessingLatencyPercentiles, "e2e-processing-latency-percentile", "message processing time percentiles to keep track of (can be specified multiple times or comma separated, default none)")
 	flagSet.Duration("e2e-processing-latency-window-time", 10*time.Minute, "calculate end to end latency quantiles for this duration of time (ie: 60s would only show quantile calculations from the past 60 seconds)")
 
@@ -174,20 +172,22 @@ func (cfg config) Validate() {
 	}
 }
 
-func main() {
+type program struct {
+	nsqd *nsqd.NSQD
+}
 
+func (p *program) Start(s service.Service) error {
+	// Start should not block. Do the actual work async.
 	flagSet := nsqFlagset()
 	flagSet.Parse(os.Args[1:])
 
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	if flagSet.Lookup("version").Value.(flag.Getter).Get().(bool) {
-		fmt.Println(version.String("nsqd"))
-		return
+		fmt.Println(util.Version("nsqd"))
+		os.Exit(0)
+		return nil
 	}
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	rand.Seed(time.Now().UTC().UnixNano())
 
 	var cfg config
 	configFile := flagSet.Lookup("config").Value.String()
@@ -201,14 +201,65 @@ func main() {
 
 	opts := nsqd.NewNSQDOptions()
 	options.Resolve(opts, flagSet, cfg)
-	nsqd := nsqd.NewNSQD(opts)
 
-	nsqd.LoadMetadata()
-	err := nsqd.PersistMetadata()
+	p.nsqd = nsqd.NewNSQD(opts)
+
+	p.nsqd.LoadMetadata()
+	err := p.nsqd.PersistMetadata()
 	if err != nil {
 		log.Fatalf("ERROR: failed to persist metadata - %s", err.Error())
 	}
-	nsqd.Main()
-	<-signalChan
-	nsqd.Exit()
+
+	go p.run()
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	// Stop should not block. Return with a few seconds.
+
+	if p.nsqd != nil {
+		signalChan := make(chan struct{})
+
+		go func() {
+			p.nsqd.Exit()
+			signalChan <- struct{}{}
+		}()
+
+		timeout, _ := time.ParseDuration("30s")
+		time.AfterFunc(timeout, func() {
+			log.Fatalf("ERROR: failed to stop nsqd in %s", timeout)
+		})
+
+		<-signalChan
+	}
+
+	return nil
+}
+
+func (p *program) run() {
+	p.nsqd.Main()
+}
+
+var logger service.Logger
+
+func main() {
+	svcConfig := &service.Config{
+		Name:        "nsqd",
+		DisplayName: "nsqd",
+		Description: "nsqd 0.3.2",
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logger, err = s.Logger(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = s.Run()
+	if err != nil {
+		logger.Error(err)
+	}
 }
