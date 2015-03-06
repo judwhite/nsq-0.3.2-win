@@ -5,13 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/bitly/nsq/internal/version"
 	"github.com/bitly/nsq/nsqlookupd"
+	"github.com/bitly/nsq/util"
+	"github.com/kardianos/service"
 	"github.com/mreiferson/go-options"
 )
 
@@ -30,16 +29,18 @@ var (
 	tombstoneLifetime       = flagSet.Duration("tombstone-lifetime", 45*time.Second, "duration of time a producer will remain tombstoned if registration remains")
 )
 
-func main() {
+type program struct {
+	daemon *nsqlookupd.NSQLookupd
+}
+
+func (p *program) Start(s service.Service) error {
 	flagSet.Parse(os.Args[1:])
 
 	if *showVersion {
-		fmt.Println(version.String("nsqlookupd"))
-		return
+		fmt.Println(util.Version("nsqlookupd"))
+		os.Exit(0)
+		return nil
 	}
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 
 	var cfg map[string]interface{}
 	if *config != "" {
@@ -51,9 +52,55 @@ func main() {
 
 	opts := nsqlookupd.NewNSQLookupdOptions()
 	options.Resolve(opts, flagSet, cfg)
-	daemon := nsqlookupd.NewNSQLookupd(opts)
+	p.daemon = nsqlookupd.NewNSQLookupd(opts)
 
-	daemon.Main()
-	<-signalChan
-	daemon.Exit()
+	p.daemon.Main()
+
+	return nil
+}
+
+func (p *program) Stop(s service.Service) error {
+	// Stop should not block. Return with a few seconds.
+
+	if p.daemon != nil {
+		signalChan := make(chan struct{})
+
+		go func() {
+			p.daemon.Exit()
+			signalChan <- struct{}{}
+		}()
+
+		timeout, _ := time.ParseDuration("30s")
+		time.AfterFunc(timeout, func() {
+			log.Fatalf("ERROR: failed to stop nsqlookupd in %s", timeout)
+		})
+
+		<-signalChan
+	}
+
+	return nil
+}
+
+var logger service.Logger
+
+func main() {
+	svcConfig := &service.Config{
+		Name:        "nsqlookupd",
+		DisplayName: "nsqlookupd",
+		Description: "nsqlookupd 0.3.2",
+	}
+
+	prg := &program{}
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logger, err = s.Logger(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = s.Run()
+	if err != nil {
+		logger.Error(err)
+	}
 }
